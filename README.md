@@ -1,6 +1,7 @@
 # GraphLLM: Boosting Graph Reasoning Ability of Large Language Model
 
 This is the implementation for the paper [GraphLLM: Boosting Graph Reasoning Ability of Large Language Model](https://arxiv.org/abs/2310.05845).
+
 Fork: Add Multi-GPU training support
 
 ## Setup
