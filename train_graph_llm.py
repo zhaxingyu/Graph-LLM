@@ -11,19 +11,22 @@ from tqdm import tqdm
 from pathlib import Path
 from accelerate import Accelerator
 from config import *
-from transformers import default_data_collator
+from transformers import default_data_collator, LlamaTokenizer
 from accelerate import DistributedDataParallelKwargs
+from accelerate.state import AcceleratorState
 
-import os
 from utils import *
 from llama import Transformer, ModelArgs
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_flash_sdp(True)
 
+import deepspeed
 
 def main(args, SEED):
     group = f"{args.dataset}"
@@ -54,7 +57,7 @@ def main(args, SEED):
             remove_columns=[i for i in dataset.column_names if i not in ['node_ids']],
             keep_in_memory=True,
             writer_batch_size=10000,
-            num_proc=1,
+            num_proc=os.cpu_count()//2,
         ).with_format("torch")
 
         clm_dataset_train = dataset.map(
@@ -64,7 +67,7 @@ def main(args, SEED):
             remove_columns=[i for i in dataset.column_names if i not in ['node_ids']],
             keep_in_memory=True,
             writer_batch_size=10000,
-            num_proc=1,
+            num_proc=os.cpu_count()//2,
         ).with_format("torch")
 
 
@@ -75,7 +78,7 @@ def main(args, SEED):
             remove_columns=[i for i in dataset.column_names if i not in ['node_ids', 'label', 'text_label']],
             keep_in_memory=True,
             writer_batch_size=10000,
-            num_proc=1,
+            num_proc=os.cpu_count()//2,
         ).with_format("torch")
 
 
@@ -103,7 +106,7 @@ def main(args, SEED):
     with open(Path(f"{module_path}/{args.model_name}/") / "params.json", "r") as f:
         params = json.loads(f.read())
 
-    model_args: ModelArgs = ModelArgs(w_lora=False,
+    model_args: ModelArgs = ModelArgs(w_lora=True,
                                       w_adapter=True,
                                       adapter_layer=8,
                                       adapter_dim=args.adapter_dim,
@@ -121,18 +124,19 @@ def main(args, SEED):
 
 
     model_args.vocab_size = tokenizer.vocab_size
-    torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-    base_model: Transformer = Transformer(params=model_args, edge_index=edge_index,
-                                          input_ids=original_dataset['input_ids'],
-                                          input_attention_mask=original_dataset['attention_mask'],
-                                          )
-    torch.set_default_tensor_type(torch.FloatTensor)
+    is_zero3 = False
+    if accelerator.distributed_type == "DEEPSPEED":
+        if AcceleratorState().deepspeed_plugin.zero_stage == 3:
+            is_zero3 = True
+            accelerator.print("ZeRO-3 is enabled. Using deepspeed.zero.Init() for model instantiation.")
 
-
-    ckpt = Path(f"{module_path}/{args.model_name}/consolidated.00.pth")
-    ckpt = torch.load(ckpt, map_location='cpu')
-    base_model.load_state_dict(ckpt, strict=False)
-
+    with deepspeed.zero.Init(enabled=is_zero3):
+        # torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        base_model: Transformer = Transformer(params=model_args, edge_index=edge_index,
+                                              input_ids=original_dataset['input_ids'],
+                                              input_attention_mask=original_dataset['attention_mask'],
+                                              )
+        # torch.set_default_tensor_type(torch.FloatTensor)
 
     accelerator.print(model_args)
 
@@ -156,17 +160,27 @@ def main(args, SEED):
     optimizer = torch.optim.AdamW(
         [
             {'params': param_adapter, 'lr': lr_group['adapter'], 'weight_decay': wd_group['adapter']},
-            {'params': param_lora, 'lr': lr_group['lora'], 'weight_decay': wd_group['lora']},
+            *([{'params': param_lora, 'lr': lr_group['lora'], 'weight_decay': wd_group['lora']}]
+              if len(param_lora) else [])
         ],
         betas=(0.9, 0.95))
-
-    trainable_params, all_param = base_model.print_trainable_params()
-    accelerator.print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}")
-
+    num_groups = len(optimizer.param_groups)
     model, train_loader, val_loader, val_loader_eval, optimizer = accelerator.prepare(base_model, train_loader,
                                                                                       val_loader, val_loader_eval,
                                                                                       optimizer)
+    ckpt_path = Path(f"{module_path}/{args.model_name}/consolidated.00.pth")
+    accelerator.print(f"Loading checkpoint from {ckpt_path} AFTER accelerator.prepare()")
+    # --- 使用 accelerator.unwrap_model(model) ---
+    # 这会返回被 DeepSpeed 和 Accelerate 完全初始化后的原始 Transformer 模型
+    unwrapped_model = accelerator.unwrap_model(model)
+    trainable_params, all_param = unwrapped_model.print_trainable_params()
+
+    # 添加一个保护性检查，防止意外的 ZeroDivisionError
+    if all_param > 0:
+        accelerator.print(
+            f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}")
+    else:
+        accelerator.print("Trainable parameter count will be available after the first forward pass in ZeRO-3.")
 
     # Step 5. Training
     num_training_steps = args.num_epochs * len(train_loader)
@@ -181,30 +195,32 @@ def main(args, SEED):
 
         for step, batch in enumerate(train_loader):
 
+            # 与Zero3不兼容
+            #with accelerator.accumulate(model):
+            optimizer.zero_grad()
+            loss = model(**batch)
+            accelerator.backward(loss)
 
-            with accelerator.accumulate(model):
-                optimizer.zero_grad()
-                loss = model(**batch)
-                accelerator.backward(loss)
-
-                accelerator.clip_grad_norm_(optimizer.param_groups[0]['params'], 0.1)
+            accelerator.clip_grad_norm_(optimizer.param_groups[0]['params'], 0.1)
+            if num_groups == 2:
                 accelerator.clip_grad_norm_(optimizer.param_groups[1]['params'], 0.1)
 
-                if (step + 1) % args.grad_steps == 0:
-                    adjust_learning_rate(optimizer.param_groups[0], lr_group['adapter'], step / len(train_loader) + epoch,
-                                         args)
-                    adjust_learning_rate(optimizer.param_groups[1], lr_group['lora'], step / len(train_loader) + epoch,
-                                         args)
+            if (step + 1) % args.grad_steps == 0:
+                adjust_learning_rate(optimizer.param_groups[0], lr_group['adapter'], step / len(train_loader) + epoch,
+                                     args)
+                if num_groups == 2:
+                     adjust_learning_rate(optimizer.param_groups[1], lr_group['lora'], step / len(train_loader) + epoch,
+                                     args)
 
-                optimizer.step()
-                epoch_loss, accum_loss = epoch_loss + loss.item(), accum_loss + loss.item()
+            optimizer.step()
+            epoch_loss, accum_loss = epoch_loss + loss.item(), accum_loss + loss.item()
 
 
             if (step + 1) % args.grad_steps == 0:
                 adapter_lr = optimizer.param_groups[0]["lr"]
-                lora_lr = optimizer.param_groups[1]["lr"]
-
-                accelerator.log({'Adapter Lr': adapter_lr, 'Lora Lr': lora_lr})
+                if num_groups == 2:
+                    lora_lr = optimizer.param_groups[1]["lr"]
+                    accelerator.log({'Adapter Lr': adapter_lr, 'Lora Lr': lora_lr})
                 accelerator.log({'Accum Loss': accum_loss / args.grad_steps})
                 accelerator.print(f"Accum Loss: {accum_loss / args.grad_steps}")
                 accum_loss = 0.
@@ -222,22 +238,26 @@ def main(args, SEED):
         model.eval()
 
         with torch.no_grad():
-            for step, batch in enumerate(val_loader):
+            # 使用 tqdm 包装 val_loader
+            for step, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch} Val Loss", disable=not accelerator.is_local_main_process)):
                 loss = model(**batch)
                 val_loss += loss.item()
 
             accelerator.print(f"Epoch: {epoch}|{args.num_epochs}: Val Loss: {val_loss / len(val_loader)}")
             accelerator.log({'Val Loss': val_loss / len(val_loader)})
 
-
-
-            for step, batch in enumerate(val_loader_eval):
+            # 使用 tqdm 包装 val_loader_eval
+            for step, batch in enumerate(tqdm(val_loader_eval, desc=f"Epoch {epoch} Generating", disable=not accelerator.is_local_main_process)):
                 kwargs = {}
                 kwargs.update(
                     {"node_ids": batch['node_ids'], "input_ids": batch['input_ids'],
                      "attention_mask": batch['attention_mask'], "max_new_tokens": 15})
 
                 generated_tokens = accelerator.unwrap_model(model).generate(**kwargs)
+                # 在 gather 之前，先将不同进程的 token 补齐到相同长度
+                generated_tokens = accelerator.pad_across_processes(
+                    generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
+                )
                 generated_tokens_gathered = accelerator.gather(generated_tokens).cpu().numpy()
 
                 if accelerator.num_processes > 1:
@@ -313,7 +333,20 @@ def main(args, SEED):
 
     # Step 6. Post-processing & Evaluating
     if accelerator.is_local_main_process:
-        eval_decode_output = []
+        # 检查 save_dir 是否被指定，并且 best_model 是否已经被成功创建
+        if args.save_dir and 'best_model' in locals() and best_model is not None:
+            output_dir = Path(args.save_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 创建一个清晰的文件名
+            model_save_path = output_dir / f"{args.dataset}_{args.model_name}_seed{SEED}_best_epoch{best_epoch}.pt"
+
+            # 保存模型的 state_dict
+            torch.save(best_model.state_dict(), model_save_path)
+            accelerator.print(f"Best model saved to {model_save_path}")
+        else:
+            accelerator.print("Model saving skipped: `save_dir` not provided or `best_model` not found.")
+            eval_decode_output = []
         for batch_output in eval_output:
             eval_decode_output.extend(tokenizer.batch_decode(batch_output, skip_special_tokens=False))
 
