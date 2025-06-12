@@ -240,10 +240,17 @@ class Attention(nn.Module):
             adapter_key, adapter_value = adapter
             adapter_len = adapter_key.shape[1]
 
-            adapter_k = self.wk(adapter_key)
+            # =================== 关键修复 ===================
+            # 将输入强制转换为 Half (float16) 来满足底层 CUDA kernel 的要求
+            adapter_key_half = adapter_key.to(torch.half)
+            adapter_value_half = adapter_value.to(torch.half)
+
+            adapter_k = self.wk(adapter_key_half)
             adapter_k = adapter_k.view(bsz, adapter_len, self.n_heads, self.head_dim)
-            adapter_v = self.wv(adapter_value)
+
+            adapter_v = self.wv(adapter_value_half)
             adapter_v = adapter_v.view(bsz, adapter_len, self.n_heads, self.head_dim)
+            # ===============================================
 
             adapter_k = apply_rotary_emb_single(adapter_k, freqs_cis=freqs_cis_prefix)
 
@@ -432,7 +439,7 @@ class Transformer(nn.Module):
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, attention_mask,
-                      (adapter_key[:, adapter_index].bfloat16(), adapter_value[:, adapter_index].bfloat16()),
+                      (adapter_key[:, adapter_index], adapter_value[:, adapter_index]),
                       freqs_cis_prefix)
 
             adapter_index = adapter_index + 1
@@ -487,7 +494,7 @@ class Transformer(nn.Module):
             adapter_key, adapter_value = adapter[0], adapter[1]
             for i, layer in enumerate(self.layers):
                 h = layer(h, start_pos, freqs_cis, attention_mask,
-                          (adapter_key[:, adapter_index].bfloat16(), adapter_value[:, adapter_index].bfloat16()),
+                          (adapter_key[:, adapter_index], adapter_value[:, adapter_index]),
                           freqs_cis_prefix if self.w_adapter else None,
                           )
                 adapter_index = adapter_index + 1
@@ -495,48 +502,65 @@ class Transformer(nn.Module):
 
         h = self.norm(h)
         output = self.output(h[:, -1, :])
-        return output.float()
+        return output.to(torch.float16)
 
-
+    # llama/model.py
     def adapter_forward(self, batch_size, node_ids):
 
         p_adapter_key, p_adapter_value = self.prefix_adapter()
         p_adapter_key = p_adapter_key.repeat(batch_size, 1, 1, 1)
         p_adapter_value = p_adapter_value.repeat(batch_size, 1, 1, 1)
 
-
         if self.adapter_len * self.adapter_layer > 0:
+            # --- 关键修改：获取当前设备，并移动相关张量 ---
+            current_device = node_ids.device
+
+            # 将模型中存储的、来自CPU的张量移动到当前GPU
+            edge_index_on_device = self.edge_index.to(current_device, non_blocking=True)
+            input_ids_on_device = self.input_ids.to(current_device, non_blocking=True)
+            input_attention_mask_on_device = self.input_attention_mask.to(current_device, non_blocking=True)
+
             if self.params.task_level == 'graph':
-                subset, edge_index_sub, mapping, batch = batch_subgraph_graph_level(self.edge_index, node_ids,
-                                                                        num_nodes=self.input_ids.shape[0],)
+                # 使用移动到GPU上的张量
+                subset, edge_index_sub, mapping, batch = batch_subgraph_graph_level(
+                    edge_index_on_device,
+                    node_ids,
+                    num_nodes=input_ids_on_device.shape[0],
+                )
 
             elif self.params.task_level == 'pair':
-                subset, edge_index_sub, mapping, batch = batch_subgraph_pair_level(self.edge_index, node_ids,
-                                                                        num_nodes=self.input_ids.shape[0],)
+                # 使用移动到GPU上的张量
+                subset, edge_index_sub, mapping, batch = batch_subgraph_pair_level(
+                    edge_index_on_device,
+                    node_ids,
+                    num_nodes=input_ids_on_device.shape[0],
+                )
 
             else:
-                subset, edge_index_sub, mapping, batch = batch_subgraph(self.edge_index, node_ids,
-                                                                        num_nodes=self.input_ids.shape[0],
-                                                                        num_hops=self.num_hops,
-                                                                        fans_out=self.params.fans_out
-                                                                        )
+                # 使用移动到GPU上的张量
+                subset, edge_index_sub, mapping, batch = batch_subgraph(
+                    edge_index_on_device,
+                    node_ids,
+                    num_nodes=input_ids_on_device.shape[0],
+                    num_hops=self.num_hops,
+                    fans_out=self.params.fans_out
+                )
 
-
+            # --- 后续的张量也需要使用移动到GPU上的版本 ---
             edge_index_full, input_node_pair_embed = add_full_rrwp(edge_index_sub, num_nodes=len(subset),
                                                                    walk_length=self.rrwp
                                                                    )
+            input_node_pair_embed = input_node_pair_embed.to(torch.float16)
 
-
-            adapter_input_ids, adapter_input_attn = self.input_ids[subset], self.input_attention_mask[subset]
+            # 使用 input_ids_on_device 和 input_attention_mask_on_device
+            adapter_input_ids, adapter_input_attn = input_ids_on_device[subset], input_attention_mask_on_device[subset]
             adapter_inputs_embeds = self.tok_embeddings(adapter_input_ids)
-
-            adapter_inputs_embeds = adapter_inputs_embeds.float()
+            adapter_inputs_embeds = adapter_inputs_embeds.to(torch.float16)
             adapter_inputs_embeds = self.down_projection(adapter_inputs_embeds)
             adapter_inputs_embeds = self.graph_adapter_encoder(adapter_inputs_embeds, adapter_input_attn)
 
             g_adapter = self.graph_adapter(adapter_inputs_embeds, adapter_input_attn, edge_index_full, mapping,
                                            input_node_pair_embed, batch)
-
 
             g_adapter = self.up_projection(g_adapter)
             g_adapter = g_adapter.repeat_interleave(self.n_layers // self.adapter_layer, dim=1)
@@ -610,11 +634,11 @@ class Transformer(nn.Module):
         for name, param in self.named_parameters():
             if any(n in name for n in adapter):
                 param.requires_grad = True
-                param.data = param.data.float()
+                # param.data = param.data.float()
                 param_adapter.append(param)
             elif "lora" in name:
                 param.requires_grad = True
-                param.data = param.data.float()
+                # param.data = param.data.float()
                 param_lora.append(param)
             else:
                 param.requires_grad = False
@@ -644,8 +668,8 @@ class PrefixEncoder(nn.Module):
         super().__init__()
         self.dim = params.dim
         self.adapter_len, self.adapter_layer = params.adapter_len, params.n_layers
-        self.prefix_keys = nn.Parameter(torch.randn(1, self.adapter_layer, self.adapter_len, self.dim), requires_grad=True)
-        self.prefix_values = nn.Parameter(torch.randn(1, self.adapter_layer, self.adapter_len, self.dim), requires_grad=True)
+        self.prefix_keys = nn.Parameter(torch.randn(1, self.adapter_layer, self.adapter_len, self.dim, dtype=torch.float16), requires_grad=True)
+        self.prefix_values = nn.Parameter(torch.randn(1, self.adapter_layer, self.adapter_len, self.dim, dtype=torch.float16), requires_grad=True)
 
         nn.init.xavier_normal_(self.prefix_values)
         nn.init.xavier_normal_(self.prefix_keys)
@@ -933,7 +957,7 @@ class CrossAttentionLayer(nn.Module):
 
         input_attn = input_attn.view(N, 1, 1, src_seqlen).repeat(1, 1, trg_seqlen, 1)
         input_attn = 1.0 - input_attn
-        input_attn = input_attn.masked_fill(input_attn.to(torch.bool), torch.finfo(input_embeds.dtype).min).float()
+        input_attn = input_attn.masked_fill(input_attn.to(torch.bool), torch.finfo(input_embeds.dtype).min).to(torch.float16)
 
         output = F.scaled_dot_product_attention(xq, xk, xv, input_attn if input_attn is not None else None)
         output = output.transpose(1, 2).contiguous().view(N, trg_seqlen, -1)
@@ -1034,7 +1058,7 @@ class EncoderSelfAttention(nn.Module):
 
         input_attn = input_attn.view(_bsz, 1, 1, query_len).repeat(1, 1, query_len, 1)
         input_attn = 1.0 - input_attn
-        input_attn = input_attn.masked_fill(input_attn.to(torch.bool), torch.finfo(query.dtype).min).float()
+        input_attn = input_attn.masked_fill(input_attn.to(torch.bool), torch.finfo(query.dtype).min).to(torch.float16)
 
         output = F.scaled_dot_product_attention(xq, xk, xv, input_attn)
 
