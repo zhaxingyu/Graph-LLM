@@ -19,6 +19,7 @@ from utils import *
 from llama import Transformer, ModelArgs
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
+from accelerate import load_checkpoint_and_dispatch
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -106,7 +107,7 @@ def main(args, SEED):
     with open(Path(f"{module_path}/{args.model_name}/") / "params.json", "r") as f:
         params = json.loads(f.read())
 
-    model_args: ModelArgs = ModelArgs(w_lora=True,
+    model_args: ModelArgs = ModelArgs(w_lora=False,
                                       w_adapter=True,
                                       adapter_layer=8,
                                       adapter_dim=args.adapter_dim,
@@ -165,6 +166,8 @@ def main(args, SEED):
         ],
         betas=(0.9, 0.95))
     num_groups = len(optimizer.param_groups)
+    if not args.save_dir:
+        print("---Warning: No save directory specified. Model will not be saved after training.---")
     model, train_loader, val_loader, val_loader_eval, optimizer = accelerator.prepare(base_model, train_loader,
                                                                                       val_loader, val_loader_eval,
                                                                                       optimizer)
@@ -278,93 +281,40 @@ def main(args, SEED):
         eval_pred = [item.split('\n\n###\n\n ')[-1] for item in eval_pred]
 
         eval_label = val_loader_eval.dataset['text_label']
+        eval_pred = eval_pred[:len(eval_label)]
         pred = [_ == f"{eval_label[i]}" for i, _ in enumerate(eval_pred)]
         val_acc = sum(pred) / len(pred)
 
-
-
-
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_model = copy.deepcopy(accelerator.unwrap_model(model).cpu())
             best_epoch = epoch
-            model = model.cuda()
+            # 只有在指定了保存目录时才执行保存操作
+            if args.save_dir:
+                # 直接定义最终的保存路径
+                if accelerator.is_main_process:
+                    print(f"\nEpoch {epoch} New best epoch found! Saving model...")
+                output_dir = Path(args.save_dir) / f"{args.dataset}_{args.model_name}_seed{SEED}_best_model"
+                # accelerator.save_model 会高效地保存完整模型
+                accelerator.save_model(model, output_dir)
+                if accelerator.is_main_process:
+                    print(
+                        f"\nEpoch {epoch}: New best validation accuracy: {val_acc:.4f}. Model saved to '{output_dir}'.")
 
         accelerator.print(f'Epoch {epoch} Val Acc {val_acc} Best Val Acc {best_val_acc} Best Epoch {best_epoch}')
         accelerator.log({'val acc': val_acc})
 
     accelerator.wait_for_everyone()
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_max_memory_allocated()
-    accelerator.wait_for_everyone()
-
-
-    # Step 5. Evaluating
-
-
-    model, test_loader = accelerator.prepare(best_model, test_loader)
-
-    samples_seen = 0
-    eval_output = []
-    model.eval()
-
-    progress_bar_test = tqdm(range(len(test_loader)))
-
-    for step, batch in enumerate(test_loader):
-        with torch.no_grad():
-            kwargs = {}
-            kwargs.update(
-                {"node_ids": batch['node_ids'], "input_ids": batch['input_ids'],
-                 "attention_mask": batch['attention_mask'], "max_new_tokens": 15})
-
-            generated_tokens = accelerator.unwrap_model(model).generate(**kwargs)
-            generated_tokens_gathered = accelerator.gather(generated_tokens).cpu().numpy()
-
-            if accelerator.num_processes > 1:
-                if step == len(test_loader) - 1:
-                    generated_tokens_gathered = generated_tokens_gathered[: len(test_loader.dataset) - samples_seen]
-                else:
-                    samples_seen += len(generated_tokens_gathered)
-
-            eval_output.append(generated_tokens_gathered)
-
-        progress_bar_test.update(1)
-
-    # Step 6. Post-processing & Evaluating
-    if accelerator.is_local_main_process:
-        # 检查 save_dir 是否被指定，并且 best_model 是否已经被成功创建
-        if args.save_dir and 'best_model' in locals() and best_model is not None:
-            output_dir = Path(args.save_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            # 创建一个清晰的文件名
-            model_save_path = output_dir / f"{args.dataset}_{args.model_name}_seed{SEED}_best_epoch{best_epoch}.pt"
-
-            # 保存模型的 state_dict
-            torch.save(best_model.state_dict(), model_save_path)
-            accelerator.print(f"Best model saved to {model_save_path}")
-        else:
-            accelerator.print("Model saving skipped: `save_dir` not provided or `best_model` not found.")
-            eval_decode_output = []
-        for batch_output in eval_output:
-            eval_decode_output.extend(tokenizer.batch_decode(batch_output, skip_special_tokens=False))
-
-        eval_pred = [item.split('</s>')[0] for item in eval_decode_output]
-        eval_pred = [item.split('\n\n###\n\n ')[-1] for item in eval_pred]
-
-        eval_label = test_loader.dataset['text_label']
-        pred = [_ == f"{eval_label[i]}" for i, _ in enumerate(eval_pred)]
-
-
-        acc = sum(pred) / len(pred)
-
-        accelerator.print(f'Test Acc {acc}')
-        accelerator.log({'Test Acc': acc})
+    print(f"Best Val Acc: {best_val_acc} at Epoch {best_epoch}")
+    print(f"--- Training completed for seed {SEED} ---")
+    if args.save_dir:
+        if accelerator.is_main_process:
+            print(f"Best model saved at {args.output_dir}.")
+    else:
+        if accelerator.is_main_process:
+            print("Save directory not specified. Model not saved.")
 
 
 if __name__ == "__main__":
-
     args = parse_args_llama()
     for exp, SEED in enumerate(range(args.exp_num)):
         init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
@@ -372,7 +322,6 @@ if __name__ == "__main__":
         transformers.logging.set_verbosity_error()
         accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs, init_kwargs],
                                   gradient_accumulation_steps=args.grad_steps)
-
         main(args, SEED)
         torch.cuda.empty_cache()
         torch.cuda.reset_max_memory_allocated()
